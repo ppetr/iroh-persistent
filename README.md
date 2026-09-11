@@ -72,4 +72,4 @@ Extracted from the connection-management layer of `zeroconf-p2p-vpn`.
 
 ## License
 
-Apache-2.0.
+Apache-2.0, see [LICENSE](LICENSE).
