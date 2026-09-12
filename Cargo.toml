@@ -17,8 +17,12 @@ name = "iroh-persistent"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-publish = false
 description = "Maintain exactly one live Iroh connection to a peer, reconnecting and resolving simultaneous connects deterministically."
+repository = "https://github.com/ppetr/iroh-persistent"
+homepage = "https://github.com/ppetr/iroh-persistent"
+readme = "README.md"
+keywords = ["iroh", "quic", "p2p", "networking", "reconnect"]
+categories = ["network-programming", "asynchronous"]
 
 [dependencies]
 backoff = "0.4"
