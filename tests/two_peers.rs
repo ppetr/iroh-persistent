@@ -23,7 +23,7 @@
 use std::time::Duration;
 
 use iroh::address_lookup::memory::MemoryLookup;
-use iroh::endpoint::{presets, Connection};
+use iroh::endpoint::{presets, ApplicationClose, Connection, ConnectionError};
 use iroh::{Endpoint, EndpointId, SecretKey};
 use iroh_persistent::PersistentConnection;
 use tokio::sync::mpsc;
@@ -173,6 +173,60 @@ async fn settles_on_a_single_shared_connection() {
     assert_eq!(high_now.stable_id(), high_conn.stable_id(), "high side switched connections");
 
     pair.shutdown().await;
+}
+
+#[tokio::test]
+#[test_log::test]
+async fn actor_close_carries_the_configured_close_code() {
+    // A single managed link plus one plain, passive endpoint on the far side -- nothing there
+    // runs a `PersistentConnection` of its own, so nothing redials or otherwise races the check
+    // below once the link's actor closes its connection.
+    let (raw_ep, raw_lookup) = bind().await;
+    let (link_ep, link_lookup) = bind().await;
+    wait_for_addrs(&raw_ep).await;
+    wait_for_addrs(&link_ep).await;
+    // Only the raw side needs to resolve the link: the link's own outgoing dials (to a remote
+    // that never accepts them) are left to fail harmlessly in the background.
+    raw_lookup.add_endpoint_info(link_ep.addr());
+    let _ = &link_lookup;
+
+    let mut link = PersistentConnection::builder(link_ep.clone(), raw_ep.id(), ALPN.to_vec())
+        .incoming(incoming_stream(&link_ep))
+        .close_code(42u32)
+        .spawn();
+
+    let raw_conn = raw_ep.connect(link_ep.id(), ALPN).await.expect("raw_ep failed to connect");
+
+    let _link_conn = wait_settled(&mut link).await;
+
+    // Dropping the link cancels its actor, which closes its held connection as part of shutdown
+    // -- an actor-initiated close, not one the test triggers directly.
+    drop(link);
+
+    // `raw_conn` belongs to no `PersistentConnection`, so the only close it can observe is the
+    // one the link's actor just performed.
+    let close = timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(err) = raw_conn.close_reason() {
+                return err;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the far side never observed the connection close");
+
+    let ConnectionError::ApplicationClosed(ApplicationClose { error_code, reason }) = close else {
+        panic!("expected an application close, got {close:?}");
+    };
+    assert_eq!(error_code, 42u32.into(), "should use the configured close code");
+    assert!(
+        String::from_utf8_lossy(&reason).starts_with("Cancelled:"),
+        "reason should start with the LoopError variant name: {reason:?}"
+    );
+
+    raw_ep.close().await;
+    link_ep.close().await;
 }
 
 #[tokio::test]
