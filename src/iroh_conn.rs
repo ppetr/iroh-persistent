@@ -16,20 +16,56 @@
 
 use std::sync::Arc;
 
-use iroh::endpoint::{ConnectError, Connection, Endpoint, Side, VarInt};
-use iroh::{EndpointAddr, EndpointId};
+use futures_util::StreamExt;
+use iroh::endpoint::{ConnectError, Connection, Endpoint, PathInfoList, Side, VarInt};
+use iroh::{EndpointAddr, EndpointId, Watcher};
 use tokio::sync::mpsc;
+use tracing::Instrument;
 
 use crate::actor::{Direction, ManagedConnection};
 use crate::connect::OutgoingConnector;
 
 /// An Iroh [`Connection`], carried through the actor as the managed handle.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct IrohConnection {
     pub conn: Connection,
     /// QUIC application error code used when this crate closes `conn` on its own; see
     /// [`crate::Builder::close_code`].
     pub(crate) close_code: VarInt,
+}
+
+impl std::fmt::Debug for IrohConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IrohConnection")
+            .field("id", &self.conn.stable_id())
+            .field("side", &self.conn.side())
+            .finish()
+    }
+}
+
+/// Logs `conn`'s network paths at debug level now and after every change, until it closes.
+fn spawn_path_logger(conn: Connection) {
+    fn log_paths(id: usize, list: PathInfoList) {
+        let paths: Vec<_> = list
+            .into_iter()
+            .map(|p| (p.remote_addr().clone(), p.is_selected(), p.is_closed()))
+            .collect();
+        tracing::debug!(id, ?paths, "paths (addr, selected, closed)");
+    }
+    log_paths(conn.stable_id(), conn.paths().get());
+    let mut changes = conn.paths().stream();
+    tokio::spawn(
+        async move {
+            loop {
+                tokio::select! {
+                    _ = conn.closed() => break,
+                    Some(list) = changes.next() => log_paths(conn.stable_id(), list),
+                    else => break,
+                }
+            }
+        }
+        .instrument(tracing::Span::current()),
+    );
 }
 
 impl PartialEq<IrohConnection> for Connection {
@@ -50,15 +86,21 @@ impl ManagedConnection for IrohConnection {
     }
 
     fn close(self, reason: &str) {
+        tracing::debug!(id = self.conn.stable_id(), reason, "closing connection");
         self.conn.close(self.close_code, reason.as_bytes());
     }
 
     fn spawn_closed_watcher(&self, on_close: mpsc::Sender<Self::ConnectionId>) {
         let conn = self.conn.clone();
-        tokio::spawn(async move {
-            let _ = conn.closed().await;
-            let _ = on_close.send(conn).await;
-        });
+        spawn_path_logger(conn.clone());
+        tokio::spawn(
+            async move {
+                let reason = conn.closed().await;
+                tracing::debug!(id = conn.stable_id(), %reason, "connection closed");
+                let _ = on_close.send(conn).await;
+            }
+            .instrument(tracing::Span::current()),
+        );
     }
 }
 

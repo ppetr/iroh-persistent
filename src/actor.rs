@@ -162,10 +162,12 @@ impl<C: ManagedConnection> Actor<C> {
             // Only clear the slot if the closed connection is exactly the installed one.
             if let Some(active) = current {
                 if closed_conn_id == *active {
+                    tracing::debug!("installed {:?} closed; clearing the slot", active);
                     *current = None;
                     return true;
                 }
             }
+            tracing::debug!("ignoring closure of a connection that is not installed");
             false
         });
     }
