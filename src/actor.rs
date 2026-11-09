@@ -49,6 +49,13 @@ pub trait ManagedConnection: std::fmt::Debug + Send + Sync + 'static {
 
     /// Whether this handle is an inbound or an outbound connection.
     fn direction(&self) -> Direction;
+    /// Reactive view of whether this connection currently has its "primary" path selected -- for
+    /// Iroh, a direct (non-relayed) one. Used only to break ties in the deterministic preference
+    /// rule (see [`Actor::new`]): a connection that has this set wins over one that doesn't, no
+    /// matter the [`Direction`] -- a connection still mid hole-punch in the preferred direction
+    /// does not get to block one that already works. Implementations with no such distinction
+    /// can return a receiver that never turns `false`.
+    fn is_direct(&self) -> watch::Receiver<bool>;
     /// Close this connection, carrying `reason` for the peer's benefit (informational).
     fn close(self, reason: &str);
     /// Spawn a task that sends this connection's id to `on_close` once it is closed.
@@ -189,6 +196,7 @@ mod tests {
     struct FakeConnection {
         id: isize,
         direction: Direction,
+        is_direct: watch::Receiver<bool>,
         closed_tx: watch::Sender<bool>,
         closed_rx: watch::Receiver<bool>,
         closed_signal: Arc<OnceLock<mpsc::Sender<isize>>>,
@@ -197,7 +205,15 @@ mod tests {
     impl FakeConnection {
         fn new(id: isize, direction: Direction) -> Self {
             let (closed_tx, closed_rx) = watch::channel(false);
-            Self { id, direction, closed_tx, closed_rx, closed_signal: Arc::new(OnceLock::new()) }
+            let (_, is_direct) = watch::channel(true);
+            Self {
+                id,
+                direction,
+                is_direct,
+                closed_tx,
+                closed_rx,
+                closed_signal: Arc::new(OnceLock::new()),
+            }
         }
 
         fn was_closed(&self) -> bool {
@@ -226,6 +242,10 @@ mod tests {
 
         fn direction(&self) -> Direction {
             self.direction
+        }
+
+        fn is_direct(&self) -> watch::Receiver<bool> {
+            self.is_direct.clone()
         }
 
         fn close(self, _: &str) {

@@ -16,9 +16,10 @@
 
 use std::sync::Arc;
 
-use iroh::endpoint::{ConnectError, Connection, Endpoint, Side, VarInt};
-use iroh::{EndpointAddr, EndpointId};
-use tokio::sync::mpsc;
+use futures_util::StreamExt;
+use iroh::endpoint::{ConnectError, Connection, Endpoint, PathInfoList, Side, VarInt};
+use iroh::{EndpointAddr, EndpointId, Watcher};
+use tokio::sync::{mpsc, watch};
 
 use crate::actor::{Direction, ManagedConnection};
 use crate::connect::OutgoingConnector;
@@ -30,6 +31,32 @@ pub struct IrohConnection {
     /// QUIC application error code used when this crate closes `conn` on its own; see
     /// [`crate::Builder::close_code`].
     pub(crate) close_code: VarInt,
+    /// Backs [`ManagedConnection::is_direct`]; fed by a task spawned once in [`Self::new`], so
+    /// repeated reads are a cheap clone rather than a fresh subscription each time.
+    is_direct: watch::Receiver<bool>,
+}
+
+impl IrohConnection {
+    pub(crate) fn new(conn: Connection, close_code: VarInt) -> Self {
+        let is_direct = spawn_is_direct_watcher(conn.clone());
+        Self { conn, close_code, is_direct }
+    }
+}
+
+fn path_is_direct(paths: PathInfoList) -> bool {
+    matches!(paths.into_iter().find(|p| p.is_selected()), Some(p) if !p.is_relay())
+}
+
+/// Spawns a task that forwards `conn`'s path-selection changes into the returned receiver.
+fn spawn_is_direct_watcher(conn: Connection) -> watch::Receiver<bool> {
+    let (tx, rx) = watch::channel(path_is_direct(conn.paths().get()));
+    let mut changes = conn.paths().map(path_is_direct).stream();
+    tokio::spawn(async move {
+        while let Some(direct) = changes.next().await {
+            let _ = tx.send(direct);
+        }
+    });
+    rx
 }
 
 impl PartialEq<IrohConnection> for Connection {
@@ -47,6 +74,10 @@ impl ManagedConnection for IrohConnection {
             Side::Client => Direction::Outgoing,
             Side::Server => Direction::Incoming,
         }
+    }
+
+    fn is_direct(&self) -> watch::Receiver<bool> {
+        self.is_direct.clone()
     }
 
     fn close(self, reason: &str) {
@@ -78,6 +109,6 @@ impl OutgoingConnector for IrohConnector {
     async fn connect(&self) -> Result<IrohConnection, Self::Error> {
         let conn =
             self.endpoint.connect(EndpointAddr::from(self.remote), self.alpn.as_ref()).await?;
-        Ok(IrohConnection { conn, close_code: self.close_code })
+        Ok(IrohConnection::new(conn, self.close_code))
     }
 }
