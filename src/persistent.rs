@@ -26,6 +26,7 @@ use iroh::{Endpoint, EndpointId};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 use crate::actor::{Actor, ActorHandle};
 use crate::connect::OutgoingConnectLoop;
@@ -108,6 +109,10 @@ impl<B: Backoff + Send + 'static> Builder<B> {
     }
 
     /// Spawn the background tasks and return the handle.
+    ///
+    /// All of them are instrumented with [`tracing::Span::current()`] as seen at this call site
+    /// -- wrap the call in your own span (e.g. carrying a peer name) if you manage more than one
+    /// [`PersistentConnection`] and want to tell their log lines apart.
     pub fn spawn(self) -> PersistentConnection {
         let cancellation = self.cancellation.unwrap_or_default();
         let local_id = self.endpoint.id();
@@ -201,6 +206,7 @@ fn spawn_incoming_pump(
     conn_tx: mpsc::Sender<IrohConnection>,
     cancellation: CancellationToken,
 ) -> JoinHandle<Result<(), LoopError>> {
+    let span = tracing::Span::current();
     tokio::spawn(async move {
         let _cancel = cancellation.drop_guard_ref();
         let Some(mut incoming) = incoming else {
@@ -229,7 +235,7 @@ fn spawn_incoming_pump(
                 }
             }
         }
-    })
+    }.instrument(span))
 }
 
 /// Mirrors the actor's `Option<IrohConnection>` slot 1:1 into `conn_tx` as `Option<Connection>`.
@@ -238,6 +244,7 @@ fn spawn_state_mirror(
     conn_tx: watch::Sender<Option<Connection>>,
     cancellation: CancellationToken,
 ) {
+    let span = tracing::Span::current();
     tokio::spawn(async move {
         let _cancel = cancellation.drop_guard_ref();
         publish(&conn_tx, &state_rx.borrow_and_update());
@@ -252,7 +259,7 @@ fn spawn_state_mirror(
                 }
             }
         }
-    });
+    }.instrument(span));
 }
 
 fn publish(conn_tx: &watch::Sender<Option<Connection>>, state: &Option<IrohConnection>) {

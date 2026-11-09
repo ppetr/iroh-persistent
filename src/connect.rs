@@ -23,6 +23,7 @@ use std::future::Future;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 use crate::error::{self, LoopError};
 
@@ -48,12 +49,14 @@ impl<C: OutgoingConnector> OutgoingConnectLoop<C> {
         Self { connector, watch_rx, tx }
     }
 
+    /// Spawns the dial loop, instrumented with [`tracing::Span::current()`] -- see
+    /// [`crate::actor::Actor::spawn`] for why.
     pub fn spawn(
         self,
         retry_backoff: impl Backoff + Send + 'static,
         cancellation: CancellationToken,
     ) -> JoinHandle<Result<(), LoopError>> {
-        tokio::spawn(self.run(retry_backoff, cancellation))
+        tokio::spawn(self.run(retry_backoff, cancellation).instrument(tracing::Span::current()))
     }
 
     pub async fn run(

@@ -27,6 +27,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::{CancellationToken, DropGuard};
+use tracing::Instrument;
 
 use crate::error::{self, LoopError};
 
@@ -88,13 +89,17 @@ impl<C: ManagedConnection> Actor<C> {
         self.conn_tx.clone()
     }
 
+    /// Spawns the actor's run loop, instrumented with [`tracing::Span::current()`] -- call this
+    /// from inside the caller's own span (e.g. one carrying a peer name) so the actor's otherwise
+    /// peer-agnostic log lines ("preferred direction: ...", candidate accept/reject decisions)
+    /// can be told apart when a process manages more than one peer.
     pub fn spawn(
         self,
         cancellation: CancellationToken,
     ) -> (ActorHandle<C>, JoinHandle<Result<(), LoopError>>) {
         let drop_guard = cancellation.clone().drop_guard();
         let conn_tx = self.connection_queue();
-        let handle = tokio::spawn(self.run(cancellation));
+        let handle = tokio::spawn(self.run(cancellation).instrument(tracing::Span::current()));
         (ActorHandle { conn_tx, _drop_guard: Arc::new(drop_guard) }, handle)
     }
 
