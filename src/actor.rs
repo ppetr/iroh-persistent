@@ -38,17 +38,6 @@ pub enum Direction {
     Outgoing,
 }
 
-/// A connection's standing under the deterministic preference rule, see [`Actor::rank`].
-/// A *greater* `Rank` is a *better* connection -- `false < true`, so a connection beats another
-/// with a smaller `Rank` in the derived, field-order lexicographic comparison. `is_direct`
-/// dominates; `direction_matches_preferred` only breaks ties between two equally-direct
-/// connections.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct Rank {
-    is_direct: bool,
-    direction_matches_preferred: bool,
-}
-
 /// Operations the [`Actor`] needs over a connection handle.
 pub trait ManagedConnection: std::fmt::Debug + Send + Sync + 'static {
     /// Peer identity type, used only for the deterministic preference rule (see [`Actor::new`]).
@@ -155,13 +144,12 @@ impl<C: ManagedConnection> Actor<C> {
         error::mask_cancelled(Err(result))
     }
 
-    /// A connection's [`Rank`]: whether it has gone direct, and -- only as a tie-break between
-    /// two equally-direct connections -- whether its direction matches what we prefer.
-    fn rank(&self, conn: &C) -> Rank {
-        Rank {
-            is_direct: *conn.is_direct().borrow(),
-            direction_matches_preferred: conn.direction() == self.preferred,
-        }
+    /// A connection's standing under the deterministic preference rule: whether it has gone
+    /// direct, and -- only as a tie-break between two equally-direct connections -- whether its
+    /// direction matches what we prefer. Compared lexicographically with `is_direct` first, so a
+    /// direct connection always outranks a non-direct one regardless of direction.
+    fn rank(&self, conn: &C) -> (bool, bool) {
+        (*conn.is_direct().borrow(), conn.direction() == self.preferred)
     }
 
     fn handle_connection_candidate(&self, closed_tx: &mpsc::Sender<C::ConnectionId>, new_conn: C) {
