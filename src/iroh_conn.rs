@@ -48,12 +48,20 @@ fn path_is_direct(paths: PathInfoList) -> bool {
 }
 
 /// Spawns a task that forwards `conn`'s path-selection changes into the returned receiver.
+///
+/// `IrohConnection::is_direct` hands out clones of that receiver rather than subscribing anew,
+/// so as long as any `IrohConnection` sharing it is still alive, at least one receiver (the
+/// field itself) exists -- `tx.send` only ever fails once the last one has been dropped, meaning
+/// no further clone can be produced either. The loop below relies on exactly that to stop
+/// itself; it cannot exit while a subscriber could still turn up.
 fn spawn_is_direct_watcher(conn: Connection) -> watch::Receiver<bool> {
     let (tx, rx) = watch::channel(path_is_direct(conn.paths().get()));
     let mut changes = conn.paths().map(path_is_direct).stream();
     tokio::spawn(async move {
         while let Some(direct) = changes.next().await {
-            let _ = tx.send(direct);
+            if tx.send(direct).is_err() {
+                break;
+            }
         }
     });
     rx
