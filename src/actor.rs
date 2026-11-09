@@ -16,9 +16,8 @@
 //!
 //! `Actor` owns the authoritative "current connection" slot for one peer. Connection candidates --
 //! from the outgoing dialer and from the inbound stream alike -- are submitted to
-//! [`Actor::connection_queue`]; the actor ranks each by [`Actor::rank`] (direct beats direction),
-//! watches the winner for closure, closes losers, and publishes the slot through a [`watch`]
-//! channel.
+//! [`Actor::connection_queue`]; the actor applies the deterministic preference rule, watches the
+//! winner for closure, closes losers, and publishes the slot through a [`watch`] channel.
 //!
 //! This module is generic over [`ManagedConnection`] so its logic can be tested without a network;
 //! the Iroh implementation lives in [`crate::iroh_conn`].
@@ -76,10 +75,6 @@ impl<C: ManagedConnection> Actor<C> {
     /// The two keys pick a preferred direction: the endpoint with the larger key prefers its
     /// outgoing connection, the other prefers its incoming one. Because one peer's outgoing
     /// connection is the other's incoming connection, both sides converge on the same one.
-    ///
-    /// This only breaks ties between otherwise-equal candidates (see [`Actor::rank`]) -- it
-    /// exists to stop both sides from each keeping a redundant, equally-good connection open, not
-    /// to express any preference about connection quality.
     ///
     /// `watch_tx` receives every change to the current-connection slot.
     pub fn new(local_key: C::Key, remote_key: C::Key, watch_tx: watch::Sender<Option<C>>) -> Self {
@@ -144,19 +139,11 @@ impl<C: ManagedConnection> Actor<C> {
         error::mask_cancelled(Err(result))
     }
 
-    /// A connection's standing under the deterministic preference rule: whether it has gone
-    /// direct, and -- only as a tie-break between two equally-direct connections -- whether its
-    /// direction matches what we prefer. Compared lexicographically with `is_direct` first, so a
-    /// direct connection always outranks a non-direct one regardless of direction.
-    fn rank(&self, conn: &C) -> (bool, bool) {
-        (*conn.is_direct().borrow(), conn.direction() == self.preferred)
-    }
-
     fn handle_connection_candidate(&self, closed_tx: &mpsc::Sender<C::ConnectionId>, new_conn: C) {
         self.watch_tx.send_if_modified(|current| {
             // Apply the transition directly to the authoritative watch channel.
             match &mut *current {
-                Some(current) if self.rank(current) >= self.rank(&new_conn) => {
+                Some(current) if new_conn.direction() != self.preferred => {
                     tracing::debug!("rejecting new {:?}; current: {:?}", new_conn, current);
                     new_conn.close("rejected by the deterministic preference rule");
                     false
@@ -216,15 +203,9 @@ mod tests {
     }
 
     impl FakeConnection {
-        /// A connection that already has its primary (direct) path -- the common case in tests
-        /// that don't care about the direct/relayed distinction.
         fn new(id: isize, direction: Direction) -> Self {
-            Self::with_direct(id, direction, true)
-        }
-
-        fn with_direct(id: isize, direction: Direction, is_direct: bool) -> Self {
             let (closed_tx, closed_rx) = watch::channel(false);
-            let (_, is_direct) = watch::channel(is_direct);
+            let (_, is_direct) = watch::channel(true);
             Self {
                 id,
                 direction,
@@ -381,54 +362,6 @@ mod tests {
         .expect("timed out waiting for `incoming` to be closed by `actor`");
 
         assert!(!actor.receiver().has_changed().unwrap());
-        let current =
-            actor.receiver().borrow_and_update().clone().expect("connection was not installed");
-        assert_eq!(current.id, outgoing.id);
-
-        actor.cancellation.cancel();
-    }
-
-    #[tokio::test]
-    async fn direct_connection_replaces_a_non_direct_one_of_the_preferred_direction() {
-        let mut actor = TestActor::new(2, 1);
-
-        // Local key is larger, therefore outgoing is preferred -- but the installed outgoing
-        // connection is still mid hole-punch, so the wrong-direction one that already works
-        // should win instead of being rejected outright.
-        let outgoing = FakeConnection::with_direct(1, Direction::Outgoing, false);
-        let incoming = FakeConnection::with_direct(2, Direction::Incoming, true);
-
-        let _ = actor.send_and_wait(&outgoing).await;
-        let current = actor.send_and_wait(&incoming).await;
-
-        assert_eq!(current.id, incoming.id);
-        assert!(outgoing.was_closed());
-        assert!(!incoming.was_closed());
-
-        actor.cancellation.cancel();
-    }
-
-    #[tokio::test]
-    async fn direction_still_breaks_ties_between_equally_non_direct_connections() {
-        let mut actor = TestActor::new(2, 1);
-
-        // Neither connection has gone direct yet, so this is the same tie-break
-        // `non_preferred_connection_is_rejected` exercises -- just confirming it's unaffected by
-        // `is_direct` once both sides of the comparison are equal on that axis.
-        let outgoing = FakeConnection::with_direct(1, Direction::Outgoing, false);
-        let incoming = FakeConnection::with_direct(2, Direction::Incoming, false);
-
-        let _ = actor.send_and_wait(&outgoing).await;
-        actor.send(&incoming).await;
-
-        timeout(Duration::from_secs(1), async {
-            while !incoming.was_closed() {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        })
-        .await
-        .expect("timed out waiting for `incoming` to be closed by `actor`");
-
         let current =
             actor.receiver().borrow_and_update().clone().expect("connection was not installed");
         assert_eq!(current.id, outgoing.id);
