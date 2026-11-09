@@ -229,7 +229,7 @@ fn spawn_incoming_pump(
                         conn.close(close_code, b"unexpected peer");
                         continue;
                     }
-                    if conn_tx.send(IrohConnection::new(conn, close_code)).await.is_err() {
+                    if conn_tx.send(IrohConnection { conn, close_code }).await.is_err() {
                         return Err(LoopError::ChannelClosed);
                     }
                 }
@@ -245,24 +245,21 @@ fn spawn_state_mirror(
     cancellation: CancellationToken,
 ) {
     let span = tracing::Span::current();
-    tokio::spawn(
-        async move {
-            let _cancel = cancellation.drop_guard_ref();
-            publish(&conn_tx, &state_rx.borrow_and_update());
-            loop {
-                tokio::select! {
-                    _ = cancellation.cancelled() => return,
-                    changed = state_rx.changed() => {
-                        if changed.is_err() {
-                            return;
-                        }
-                        publish(&conn_tx, &state_rx.borrow_and_update());
+    tokio::spawn(async move {
+        let _cancel = cancellation.drop_guard_ref();
+        publish(&conn_tx, &state_rx.borrow_and_update());
+        loop {
+            tokio::select! {
+                _ = cancellation.cancelled() => return,
+                changed = state_rx.changed() => {
+                    if changed.is_err() {
+                        return;
                     }
+                    publish(&conn_tx, &state_rx.borrow_and_update());
                 }
             }
         }
-        .instrument(span),
-    );
+    }.instrument(span));
 }
 
 fn publish(conn_tx: &watch::Sender<Option<Connection>>, state: &Option<IrohConnection>) {
