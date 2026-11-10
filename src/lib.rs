@@ -17,7 +17,9 @@
 //! Given a local [`Endpoint`], the remote's [`EndpointId`], and (optionally) a stream of inbound
 //! [`Connection`]s already demultiplexed to that peer, [`PersistentConnection`]:
 //!
-//! * actively dials the remote with exponential backoff whenever no connection is held;
+//! * actively dials the remote with exponential backoff whenever no connection is held (the
+//!   backoff restarts only after a connection has been held for [`DEFAULT_STABLE_AFTER`] or the
+//!   configured [`Builder::stable_after`]);
 //! * accepts inbound connections for that peer from the supplied stream;
 //! * keeps a single connection, resolving simultaneous connects deterministically -- both peers
 //!   agree on the winner from the ordering of their [`EndpointId`]s;
@@ -55,7 +57,7 @@ pub use actor::{Direction, ManagedConnection};
 pub use connect::OutgoingConnector;
 pub use error::LoopError;
 pub use iroh_conn::{IrohConnection, IrohConnector};
-pub use persistent::{Builder, PersistentConnection};
+pub use persistent::{Builder, PersistentConnection, DEFAULT_STABLE_AFTER};
 
 /// Re-exported so callers can build a custom retry policy for [`Builder::backoff`].
 pub use backoff;

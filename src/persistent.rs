@@ -16,6 +16,7 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use backoff::backoff::Backoff;
 use backoff::ExponentialBackoff;
@@ -35,6 +36,10 @@ use crate::iroh_conn::{IrohConnection, IrohConnector};
 
 type ConnectionStream = Pin<Box<dyn Stream<Item = Connection> + Send>>;
 
+/// Default for [`Builder::stable_after`]: how long a connection must be held before the outgoing
+/// dial backoff is reset.
+pub const DEFAULT_STABLE_AFTER: Duration = Duration::from_secs(5);
+
 /// Builds a [`PersistentConnection`]. Created via [`PersistentConnection::builder`].
 pub struct Builder<B = ExponentialBackoff> {
     endpoint: Endpoint,
@@ -42,6 +47,7 @@ pub struct Builder<B = ExponentialBackoff> {
     alpn: Vec<u8>,
     incoming: Option<ConnectionStream>,
     backoff: B,
+    stable_after: Duration,
     cancellation: Option<CancellationToken>,
     close_code: VarInt,
 }
@@ -55,6 +61,7 @@ impl Builder<ExponentialBackoff> {
             incoming: None,
             // Retry outgoing dials forever; the `backoff` default caps only total elapsed time.
             backoff: ExponentialBackoff { max_elapsed_time: None, ..Default::default() },
+            stable_after: DEFAULT_STABLE_AFTER,
             cancellation: None,
             close_code: VarInt::from_u32(0),
         }
@@ -82,9 +89,21 @@ impl<B: Backoff + Send + 'static> Builder<B> {
             alpn: self.alpn,
             incoming: self.incoming,
             backoff,
+            stable_after: self.stable_after,
             cancellation: self.cancellation,
             close_code: self.close_code,
         }
+    }
+
+    /// How long a connection must be held before the backoff between outgoing dials is reset
+    /// (default [`DEFAULT_STABLE_AFTER`]).
+    ///
+    /// A connection that is lost or replaced sooner -- typically one the peer immediately rejects
+    /// -- counts as a failed attempt, so the backoff keeps growing instead of restarting from its
+    /// initial delay. `Duration::ZERO` resets as soon as a connection is installed.
+    pub fn stable_after(mut self, stable_after: Duration) -> Self {
+        self.stable_after = stable_after;
+        self
     }
 
     /// Drive shutdown from an external token in addition to dropping the returned
@@ -130,9 +149,13 @@ impl<B: Backoff + Send + 'static> Builder<B> {
         let actor = Actor::new(local_id, remote, state_tx);
         let (actor_handle, actor_join) = actor.spawn(cancellation.clone());
 
-        let outgoing_join =
-            OutgoingConnectLoop::new(connector, state_rx.clone(), actor_handle.conn_tx.clone())
-                .spawn(self.backoff, cancellation.clone());
+        let outgoing_join = OutgoingConnectLoop::new(
+            connector,
+            state_rx.clone(),
+            actor_handle.conn_tx.clone(),
+            self.stable_after,
+        )
+        .spawn(self.backoff, cancellation.clone());
 
         let incoming_join = spawn_incoming_pump(
             self.incoming,

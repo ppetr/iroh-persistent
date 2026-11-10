@@ -13,7 +13,9 @@ Given
 
 `PersistentConnection`:
 
-* **actively dials** the remote with exponential backoff whenever no connection is held;
+* **actively dials** the remote with exponential backoff whenever no connection is held; the
+  backoff restarts only after a connection has been held for a while (`Builder::stable_after`,
+  5 s by default), so a connection the peer keeps rejecting does not make it redial in a tight loop;
 * **accepts** inbound connections for that peer from the supplied stream;
 * keeps a **single** connection. It does not race for a "preferred" one — any connection is enough
   — but if both peers dial at once and two connections briefly exist, a **deterministic** rule
@@ -56,7 +58,7 @@ Three tasks around one connection slot owned by an actor:
 | task | source file | role |
 |---|---|---|
 | actor | `src/actor.rs` | authoritative `Option<Connection>` slot; deterministic conflict rule; closed-connection watcher |
-| outgoing dial loop | `src/connect.rs` | dials with exponential backoff while the slot is empty; parks while a connection is held |
+| outgoing dial loop | `src/connect.rs` | dials with exponential backoff while the slot is empty; parks while a connection is held, resetting the backoff once it has proven stable |
 | inbound pump | `src/persistent.rs` | filters the caller's stream to the configured peer, forwards to the actor |
 
 The conflict rule: the first connection is installed regardless of direction; a later one replaces

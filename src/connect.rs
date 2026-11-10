@@ -16,10 +16,13 @@
 //!
 //! `OutgoingConnectLoop` watches the current-connection slot and, whenever it is empty, dials the
 //! remote with an exponential backoff, submitting each successful connection to the actor's queue.
-//! While a connection is held it parks and resets the backoff; a change back to `None` wakes it.
+//! While a connection is held it parks; a change back to `None` wakes it. The backoff is reset only
+//! once a connection has been held for `stable_after` -- a connection that is lost sooner (for
+//! example because the peer rejected it) counts as a failed attempt and the backoff keeps growing.
 
 use backoff::backoff::Backoff;
 use std::future::Future;
+use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -38,6 +41,7 @@ pub struct OutgoingConnectLoop<C: OutgoingConnector> {
     connector: C,
     watch_rx: watch::Receiver<Option<C::Connection>>,
     tx: mpsc::Sender<C::Connection>,
+    stable_after: Duration,
 }
 
 impl<C: OutgoingConnector> OutgoingConnectLoop<C> {
@@ -45,8 +49,9 @@ impl<C: OutgoingConnector> OutgoingConnectLoop<C> {
         connector: C,
         watch_rx: watch::Receiver<Option<C::Connection>>,
         tx: mpsc::Sender<C::Connection>,
+        stable_after: Duration,
     ) -> Self {
-        Self { connector, watch_rx, tx }
+        Self { connector, watch_rx, tx, stable_after }
     }
 
     /// Spawns the dial loop, instrumented with [`tracing::Span::current()`] -- see
@@ -69,14 +74,25 @@ impl<C: OutgoingConnector> OutgoingConnectLoop<C> {
         let err = loop {
             // Read the current state and mark it as seen.
             if self.watch_rx.borrow_and_update().is_some() {
+                tokio::select! {
+                    _ = cancellation.cancelled() => break LoopError::Cancelled,
+                    changed_res = self.watch_rx.changed() => {
+                        if changed_res.is_err() {
+                            break LoopError::ChannelClosed;
+                        }
+                        tracing::debug!("connection changed before it proved stable; keeping the back-off");
+                        continue;
+                    }
+                    _ = tokio::time::sleep(self.stable_after) => {}
+                }
                 tracing::debug!(
-                    "connection is active; resetting back-off and waiting until a new connection is needed"
+                    "connection is stable; resetting back-off and waiting until a new connection is needed"
                 );
+                retry_backoff.reset();
                 tokio::select! {
                     _ = cancellation.cancelled() => break LoopError::Cancelled,
                     changed_res = self.watch_rx.changed() => if changed_res.is_err() { break LoopError::ChannelClosed },
                 }
-                retry_backoff.reset();
                 continue;
             }
 
@@ -87,7 +103,7 @@ impl<C: OutgoingConnector> OutgoingConnectLoop<C> {
                 break LoopError::BackoffExhausted;
             };
 
-            if delay > std::time::Duration::ZERO {
+            if delay > Duration::ZERO {
                 let span = tracing::debug_span!("backoff_sleep", delay = ?delay);
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {
@@ -98,8 +114,7 @@ impl<C: OutgoingConnector> OutgoingConnectLoop<C> {
                         if changed_res.is_err() {
                             break LoopError::ChannelClosed;
                         }
-                        tracing::debug!("connection update, resetting the backoff");
-                        retry_backoff.reset();
+                        tracing::debug!("connection update during the back-off sleep");
                         continue;
                     }
                     _ = cancellation.cancelled() => break LoopError::Cancelled,
@@ -123,7 +138,6 @@ impl<C: OutgoingConnector> OutgoingConnectLoop<C> {
                             changed_res = self.watch_rx.changed() => if changed_res.is_err() { break LoopError::ChannelClosed },
                         }
                         tracing::debug!("successfully submitted a connection to the queue");
-                        retry_backoff.reset();
                     }
                     Err(err) => {
                         tracing::info!(error = ?err, backoff = ?delay, "connection attempt failed, retrying with a back-off");
@@ -140,23 +154,24 @@ impl<C: OutgoingConnector> OutgoingConnectLoop<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-    use std::time::Duration;
-    use tokio::sync::{mpsc, watch, Notify};
-    use tokio::time::timeout;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::{mpsc, watch};
+    use tokio::time::Instant;
 
-    #[derive(Debug)]
+    const STABLE: Duration = Duration::from_secs(5);
+
+    /// Yields the given delays in order; counts `reset` calls (the loop resets once at startup).
     struct MockBackoff {
         delays: Vec<Duration>,
         index: isize,
-        reset_tx: watch::Sender<isize>,
-        reset_rx: watch::Receiver<isize>,
+        resets: Arc<AtomicUsize>,
     }
 
     impl MockBackoff {
-        fn new(delays: Vec<Duration>) -> Self {
-            let (reset_tx, reset_rx) = watch::channel(0);
-            Self { delays, index: -1, reset_tx, reset_rx }
+        fn new(delays: Vec<Duration>) -> (Self, Arc<AtomicUsize>) {
+            let resets = Arc::new(AtomicUsize::new(0));
+            (Self { delays, index: -1, resets: resets.clone() }, resets)
         }
     }
 
@@ -167,7 +182,7 @@ mod tests {
         }
 
         fn reset(&mut self) {
-            self.reset_tx.send(self.index + 1).unwrap();
+            self.resets.fetch_add(1, Ordering::SeqCst);
             self.index = -1;
         }
     }
@@ -175,13 +190,14 @@ mod tests {
     struct MockConnector {
         /// Mutex allows mutating the vector even in the non-`mut` `connect` function.
         connect_results: Mutex<Vec<Result<i32, &'static str>>>,
-        connected: Notify,
+        connect_times: Arc<Mutex<Vec<Instant>>>,
     }
 
     impl MockConnector {
-        fn new(mut results: Vec<Result<i32, &'static str>>) -> Self {
+        fn new(mut results: Vec<Result<i32, &'static str>>) -> (Self, Arc<Mutex<Vec<Instant>>>) {
             results.reverse(); // FIFO order from a vector
-            Self { connect_results: Mutex::new(results), connected: Notify::new() }
+            let times = Arc::new(Mutex::new(Vec::new()));
+            (Self { connect_results: Mutex::new(results), connect_times: times.clone() }, times)
         }
     }
 
@@ -190,10 +206,24 @@ mod tests {
         type Error = &'static str;
 
         async fn connect(&self) -> Result<Self::Connection, Self::Error> {
-            self.connected.notify_one();
+            self.connect_times.lock().unwrap().push(Instant::now());
             let mut guard = self.connect_results.lock().unwrap();
             guard.pop().unwrap_or(Err("No more configured results"))
         }
+    }
+
+    fn secs(s: f64) -> Duration {
+        Duration::from_secs_f64(s)
+    }
+
+    /// The paused tokio clock rounds timer deadlines up to whole milliseconds.
+    #[track_caller]
+    fn assert_near(actual: Duration, expected: Duration) {
+        let tolerance = Duration::from_millis(5);
+        assert!(
+            actual >= expected && actual <= expected + tolerance,
+            "expected {expected:?} (+{tolerance:?}), got {actual:?}"
+        );
     }
 
     // --- Tests ---
@@ -201,45 +231,36 @@ mod tests {
     #[tokio::test]
     #[test_log::test]
     #[ntest::timeout(300)]
-    async fn test_successful_connection_flow() {
-        // Scenario: Starts with None -> Connects successfully -> Sends to mpsc ->
-        //           Waits for watch_rx to update -> Resets backoff -> Enters active state loop.
+    async fn test_backoff_reset_only_after_connection_is_stable() {
+        // Scenario: Connects -> connection held -> no reset until `STABLE` has passed ->
+        //           connection lost -> next dial starts again from the first backoff delay.
         tokio::time::pause();
 
-        let (watch_tx, mut watch_rx) = watch::channel(None);
+        let (watch_tx, watch_rx) = watch::channel(None);
         let (mpsc_tx, mut mpsc_rx) = mpsc::channel(1);
-
-        let connector = MockConnector::new(vec![Ok(42)]);
-        let backoff = MockBackoff::new(vec![Duration::from_secs(1)]);
-        let mut reset_rx = backoff.reset_rx.clone();
-
+        let (connector, times) = MockConnector::new(vec![Ok(42)]);
+        let (backoff, resets) = MockBackoff::new(vec![secs(1.0)]);
         let cancellation = CancellationToken::new();
 
-        let connector_fut = OutgoingConnectLoop::new(connector, watch_rx.clone(), mpsc_tx)
+        let connector_fut = OutgoingConnectLoop::new(connector, watch_rx, mpsc_tx, STABLE)
             .run(backoff, cancellation.clone());
         let scenario_fut = async {
-            // Advance time to trigger the connect attempt after its initial backoff delay
-            tokio::time::advance(Duration::from_secs(1)).await;
-
-            // Verify the connection object was sent to the pipeline
-            let received = mpsc_rx.recv().await.unwrap();
-            assert_eq!(received, 42);
-
-            // Simulate the manager updating the watch channel with the new active connection
+            let start = Instant::now();
+            assert_eq!(mpsc_rx.recv().await.unwrap(), 42);
             watch_tx.send(Some(42)).unwrap();
-            assert!(
-                timeout(Duration::from_millis(200), reset_rx.changed()).await.is_ok(),
-                "Reset should be called after successful connection and watch channel update synchronization.");
 
-            // Trigger a disconnect request to break the active loop and allow termination
-            watch_rx.mark_unchanged();
+            tokio::time::sleep(secs(4.0)).await;
+            assert_eq!(resets.load(Ordering::SeqCst), 1, "only the startup reset so far");
+            tokio::time::sleep(secs(1.5)).await;
+            assert_eq!(resets.load(Ordering::SeqCst), 2, "reset once the connection proved stable");
+
             watch_tx.send(None).unwrap();
-            watch_rx.changed().await.unwrap();
-            assert!(
-                timeout(Duration::from_millis(100), reset_rx.changed()).await.is_ok(),
-                "Reset should be called after resetting the connection to None"
-            );
-
+            tokio::time::sleep(secs(1.5)).await;
+            let times = times.lock().unwrap();
+            assert_eq!(times.len(), 2);
+            assert_near(times[0] - start, secs(1.0));
+            // First dial at 1.0 s, connection lost at 6.5 s, first delay (1 s) again -> second dial at 7.5 s.
+            assert_near(times[1] - times[0], secs(6.5));
             cancellation.cancel();
         };
 
@@ -250,32 +271,64 @@ mod tests {
     #[tokio::test]
     #[test_log::test]
     #[ntest::timeout(300)]
-    async fn test_backoff_interrupted_by_external_connection() {
-        // Scenario: Starts with None -> Fails once -> Next backoff is 10s ->
-        //           During sleep, external system provides connection (Some) ->
-        //           Sleep is interrupted -> Backoff resets -> Waits in active loop.
+    async fn test_backoff_keeps_growing_when_connections_are_lost_early() {
+        // Scenario: Each submitted connection is lost right away (e.g. rejected by the peer) ->
+        //           no reset, and successive dials are spaced by the growing delays.
+        tokio::time::pause();
+
+        let (watch_tx, watch_rx) = watch::channel(None);
+        let (mpsc_tx, mut mpsc_rx) = mpsc::channel(1);
+        let (connector, times) = MockConnector::new(vec![Ok(1), Ok(2), Ok(3)]);
+        let (backoff, resets) = MockBackoff::new(vec![secs(1.0), secs(2.0), secs(4.0)]);
+        let cancellation = CancellationToken::new();
+
+        let connector_fut = OutgoingConnectLoop::new(connector, watch_rx, mpsc_tx, STABLE)
+            .run(backoff, cancellation.clone());
+        let scenario_fut = async {
+            for expected in 1..=3 {
+                assert_eq!(mpsc_rx.recv().await.unwrap(), expected);
+                watch_tx.send(Some(expected)).unwrap();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                watch_tx.send(None).unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+
+            assert_eq!(resets.load(Ordering::SeqCst), 1, "only the startup reset");
+            let times = times.lock().unwrap();
+            assert_eq!(times.len(), 3);
+            assert_near(times[1] - times[0], Duration::from_millis(2010));
+            assert_near(times[2] - times[1], Duration::from_millis(4010));
+            cancellation.cancel();
+        };
+
+        let (result, _) = tokio::join!(connector_fut, scenario_fut);
+        tracing::info!("{:?}", result);
+    }
+
+    #[tokio::test]
+    #[test_log::test]
+    #[ntest::timeout(300)]
+    async fn test_external_connection_during_backoff_sleep_does_not_reset_immediately() {
+        // Scenario: Backoff sleep -> an inbound connection arrives -> the dial is skipped ->
+        //           the backoff is reset only after `STABLE`.
         tokio::time::pause();
 
         let (watch_tx, watch_rx) = watch::channel(None);
         let (mpsc_tx, _mpsc_rx) = mpsc::channel(1);
+        let (connector, times) = MockConnector::new(vec![]);
+        let (backoff, resets) = MockBackoff::new(vec![secs(10.0)]);
 
-        let connector = MockConnector::new(vec![Err("Failed")]);
-        let backoff = MockBackoff::new(vec![Duration::from_secs(10)]);
-        let mut reset_rx = backoff.reset_rx.clone();
-
-        let connector_fut = OutgoingConnectLoop::new(connector, watch_rx, mpsc_tx)
+        let connector_fut = OutgoingConnectLoop::new(connector, watch_rx, mpsc_tx, STABLE)
             .run(backoff, CancellationToken::new());
         let scenario_fut = async {
-            // Process the first failure and enter the 10-second backoff sleep
-            tokio::time::advance(Duration::from_millis(100)).await;
-
-            // Simulate external entity establishing a connection after 2 seconds
-            tokio::time::advance(Duration::from_secs(2)).await;
-            reset_rx.mark_unchanged();
+            tokio::time::sleep(secs(2.0)).await;
             watch_tx.send(Some(777)).unwrap();
-            assert!(
-                timeout(Duration::from_millis(100), reset_rx.changed()).await.is_ok(),
-                "Reset should be called exactly when the select! backoff sleep was interrupted by Some");
+
+            tokio::time::sleep(secs(4.0)).await;
+            assert_eq!(resets.load(Ordering::SeqCst), 1);
+            tokio::time::sleep(secs(2.0)).await;
+            assert_eq!(resets.load(Ordering::SeqCst), 2);
+            assert!(times.lock().unwrap().is_empty(), "no dial while a connection is held");
 
             // Drop the channel to break the loop and finish the test
             drop(watch_tx);
@@ -288,43 +341,26 @@ mod tests {
     #[tokio::test]
     #[test_log::test]
     #[ntest::timeout(300)]
-    async fn test_backoff_interrupted_by_explicit_immediate_retry() {
-        // Scenario: Starts with None -> Fails -> Backoff is 10s ->
-        //           User sends None again to force immediate retry ->
-        //           Sleep is interrupted -> Backoff resets -> Connects immediately.
+    async fn test_replacing_connection_restarts_stability_timer() {
+        // Scenario: A connection is replaced by another one before `STABLE` -> the timer restarts.
         tokio::time::pause();
 
-        let (watch_tx, watch_rx) = watch::channel(None);
-        let (mpsc_tx, mut mpsc_rx) = mpsc::channel(1);
+        let (watch_tx, watch_rx) = watch::channel(Some(1));
+        let (mpsc_tx, _mpsc_rx) = mpsc::channel(1);
+        let (connector, _times) = MockConnector::new(vec![]);
+        let (backoff, resets) = MockBackoff::new(vec![secs(1.0)]);
 
-        let connector = MockConnector::new(vec![Err("Failed"), Ok(99)]);
-        let backoff = MockBackoff::new(vec![Duration::from_secs(10), Duration::from_secs(1)]);
-        let mut reset_rx = backoff.reset_rx.clone();
-
-        let cancellation = CancellationToken::new();
-        let connector_fut = OutgoingConnectLoop::new(connector, watch_rx, mpsc_tx)
-            .run(backoff, cancellation.clone());
-
+        let connector_fut = OutgoingConnectLoop::new(connector, watch_rx, mpsc_tx, STABLE)
+            .run(backoff, CancellationToken::new());
         let scenario_fut = async {
-            // Process the first failure and enter the 10-second sleep
-            tokio::time::advance(Duration::from_millis(100)).await;
+            tokio::time::sleep(secs(3.0)).await;
+            watch_tx.send(Some(2)).unwrap();
 
-            // Force an immediate retry by explicitly pushing None again
-            reset_rx.mark_unchanged();
-            watch_tx.send(None).unwrap();
-            assert!(
-                timeout(Duration::from_millis(100), reset_rx.changed()).await.is_ok(),
-                "Reset should be called when select! was interrupted by the explicit None signal"
-            );
+            tokio::time::sleep(secs(4.5)).await;
+            assert_eq!(resets.load(Ordering::SeqCst), 1, "only 4.5 s since replacement");
+            tokio::time::sleep(secs(1.0)).await;
+            assert_eq!(resets.load(Ordering::SeqCst), 2);
 
-            // The delay was reset, so the next backoff fetched is 1s. Advance to trigger it.
-            tokio::time::advance(Duration::from_secs(1)).await;
-
-            // Verify it proceeded to connect immediately and successfully
-            let received = mpsc_rx.recv().await.unwrap();
-            assert_eq!(received, 99);
-
-            cancellation.cancel();
             drop(watch_tx);
         };
 
