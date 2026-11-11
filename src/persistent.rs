@@ -30,8 +30,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use crate::actor::{Actor, ActorHandle};
-use crate::connect::OutgoingConnectLoop;
-use crate::error::{await_loop_result, LoopError};
+use crate::connect::{HandlerFeedback, OutgoingConnectLoop};
+use crate::error::{self, await_loop_result, LoopError};
+use crate::handler::{ConnectionHandler, HandlerLoop};
 use crate::iroh_conn::{IrohConnection, IrohConnector};
 
 type ConnectionStream = Pin<Box<dyn Stream<Item = Connection> + Send>>;
@@ -127,12 +128,52 @@ impl<B: Backoff + Send + 'static> Builder<B> {
         self
     }
 
-    /// Spawn the background tasks and return the handle.
+    /// Spawn the background tasks and return the handle; the current connection is published
+    /// through [`PersistentConnection::connection`].
     ///
     /// All of them are instrumented with [`tracing::Span::current()`] as seen at this call site
     /// -- wrap the call in your own span (e.g. carrying a peer name) if you manage more than one
     /// [`PersistentConnection`] and want to tell their log lines apart.
     pub fn spawn(self) -> PersistentConnection {
+        let started = self.start(None);
+        PersistentConnection {
+            connection: started.conn_rx,
+            // `ActorHandle` carries a drop guard for `cancellation`; holding it here is what keeps
+            // the background tasks alive until this `PersistentConnection` is dropped.
+            _actor: started.actor,
+            _supervisor: started.supervisor,
+        }
+    }
+
+    /// Like [`Self::spawn`], but instead of publishing the connection the library hands every
+    /// connection it installs to `handler`, one at a time.
+    ///
+    /// The handler's [`crate::Outcome`] replaces [`Self::stable_after`] as the rule for resetting the
+    /// dial backoff: [`crate::Outcome::Done`] resets it, [`crate::Outcome::Failed`] keeps it growing. When
+    /// [`ConnectionHandler::handle`] returns, the library closes the connection. Dropping the
+    /// returned [`PersistentLink`] shuts everything down; see also [`PersistentLink::join`].
+    pub fn spawn_with<H: ConnectionHandler>(self, handler: H) -> PersistentLink<H> {
+        let close_code = self.close_code;
+        let (busy_tx, busy_rx) = watch::channel(false);
+        let (outcome_tx, outcome_rx) = mpsc::unbounded_channel();
+        let started = self.start(Some(HandlerFeedback { busy: busy_rx, outcomes: outcome_rx }));
+
+        let handler_loop = HandlerLoop {
+            handler,
+            conn_rx: started.conn_rx,
+            outcomes: outcome_tx,
+            busy: busy_tx,
+            close_code,
+        };
+        PersistentLink {
+            handler_task: handler_loop.spawn(started.cancellation),
+            _actor: started.actor,
+            supervisor: started.supervisor,
+        }
+    }
+
+    /// Spawns the actor, the dial loop, the inbound pump and the slot mirror.
+    fn start(self, feedback: Option<HandlerFeedback>) -> Started {
         let cancellation = self.cancellation.unwrap_or_default();
         let local_id = self.endpoint.id();
         let remote = self.remote;
@@ -149,13 +190,16 @@ impl<B: Backoff + Send + 'static> Builder<B> {
         let actor = Actor::new(local_id, remote, state_tx);
         let (actor_handle, actor_join) = actor.spawn(cancellation.clone());
 
-        let outgoing_join = OutgoingConnectLoop::new(
+        let mut outgoing = OutgoingConnectLoop::new(
             connector,
             state_rx.clone(),
             actor_handle.conn_tx.clone(),
             self.stable_after,
-        )
-        .spawn(self.backoff, cancellation.clone());
+        );
+        if let Some(feedback) = feedback {
+            outgoing = outgoing.with_feedback(feedback);
+        }
+        let outgoing_join = outgoing.spawn(self.backoff, cancellation.clone());
 
         let incoming_join = spawn_incoming_pump(
             self.incoming,
@@ -176,13 +220,52 @@ impl<B: Backoff + Send + 'static> Builder<B> {
             await_loop_result(actor_join).await
         });
 
-        PersistentConnection {
-            connection: conn_rx,
-            // `ActorHandle` carries a drop guard for `cancellation`; holding it here is what keeps
-            // the background tasks alive until this `PersistentConnection` is dropped.
-            _actor: actor_handle,
-            _supervisor: supervisor,
-        }
+        Started { cancellation, conn_rx, actor: actor_handle, supervisor }
+    }
+}
+
+/// The tasks spawned by [`Builder::start`].
+struct Started {
+    cancellation: CancellationToken,
+    conn_rx: watch::Receiver<Option<Connection>>,
+    actor: ActorHandle<IrohConnection>,
+    supervisor: JoinHandle<Result<(), LoopError>>,
+}
+
+/// A link whose connections are served by a [`ConnectionHandler`]; see [`Builder::spawn_with`].
+///
+/// Drop it to close the connection and stop all background work.
+pub struct PersistentLink<H> {
+    handler_task: JoinHandle<(H, Result<(), LoopError>)>,
+    // Keeps the background tasks alive; see `PersistentConnection::_actor`.
+    _actor: ActorHandle<IrohConnection>,
+    supervisor: JoinHandle<Result<(), LoopError>>,
+}
+
+/// How a [`PersistentLink`] ended.
+#[derive(Debug)]
+pub struct LinkEnd<H> {
+    /// The handler, handed back so the application can finish its own cleanup. `None` if the
+    /// handler's task panicked (and `result` is then [`LoopError::Panicked`]).
+    pub handler: Option<H>,
+    /// `Ok` after a normal shutdown, otherwise the first error of the link's tasks.
+    pub result: Result<(), LoopError>,
+}
+
+impl<H> PersistentLink<H> {
+    /// Waits until the link ends -- cancellation through [`Builder::cancellation`], or a failure of
+    /// one of its tasks -- and returns the handler. The handler is no longer running by then.
+    pub async fn join(self) -> LinkEnd<H> {
+        let (handler, handler_result) = match self.handler_task.await {
+            Ok((handler, result)) => (Some(handler), result),
+            Err(err) if err.is_cancelled() => (None, Ok(())),
+            Err(err) => {
+                tracing::error!(error = ?err, "connection handler task panicked");
+                (None, Err(LoopError::Panicked))
+            }
+        };
+        let result = handler_result.and(await_loop_result(self.supervisor).await);
+        LinkEnd { handler, result }
     }
 }
 
@@ -253,7 +336,7 @@ fn spawn_incoming_pump(
                         continue;
                     }
                     if conn_tx.send(IrohConnection { conn, close_code }).await.is_err() {
-                        return Err(LoopError::ChannelClosed);
+                        return Err(error::settle(LoopError::ChannelClosed, &cancellation));
                     }
                 }
             }
@@ -268,21 +351,24 @@ fn spawn_state_mirror(
     cancellation: CancellationToken,
 ) {
     let span = tracing::Span::current();
-    tokio::spawn(async move {
-        let _cancel = cancellation.drop_guard_ref();
-        publish(&conn_tx, &state_rx.borrow_and_update());
-        loop {
-            tokio::select! {
-                _ = cancellation.cancelled() => return,
-                changed = state_rx.changed() => {
-                    if changed.is_err() {
-                        return;
+    tokio::spawn(
+        async move {
+            let _cancel = cancellation.drop_guard_ref();
+            publish(&conn_tx, &state_rx.borrow_and_update());
+            loop {
+                tokio::select! {
+                    _ = cancellation.cancelled() => return,
+                    changed = state_rx.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                        publish(&conn_tx, &state_rx.borrow_and_update());
                     }
-                    publish(&conn_tx, &state_rx.borrow_and_update());
                 }
             }
         }
-    }.instrument(span));
+        .instrument(span),
+    );
 }
 
 fn publish(conn_tx: &watch::Sender<Option<Connection>>, state: &Option<IrohConnection>) {

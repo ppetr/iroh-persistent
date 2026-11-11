@@ -16,6 +16,7 @@
 
 use strum_macros::{AsRefStr, EnumString};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 /// Why one of [`PersistentConnection`]'s internal loops stopped.
 ///
@@ -63,6 +64,16 @@ impl std::fmt::Display for LoopError {
 impl std::error::Error for LoopError {}
 
 /// Turns the [`LoopError::Cancelled`] sentinel back into `Ok(())`; passes everything else through.
+/// Reports a closed channel as [`LoopError::Cancelled`] if the shared token already fired: the
+/// channel was then closed by the shutdown itself, not by a fault.
+pub fn settle(err: LoopError, cancellation: &CancellationToken) -> LoopError {
+    if err == LoopError::ChannelClosed && cancellation.is_cancelled() {
+        LoopError::Cancelled
+    } else {
+        err
+    }
+}
+
 pub fn mask_cancelled(result: Result<(), LoopError>) -> Result<(), LoopError> {
     match result {
         Err(LoopError::Cancelled) => {

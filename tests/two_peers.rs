@@ -25,9 +25,10 @@ use std::time::Duration;
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::endpoint::{presets, ApplicationClose, Connection, ConnectionError};
 use iroh::{Endpoint, EndpointId, SecretKey};
-use iroh_persistent::PersistentConnection;
+use iroh_persistent::{ConnectionHandler, Outcome, PersistentConnection};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 
 const ALPN: &[u8] = b"iroh-persistent/test/two-peers/1";
 
@@ -82,18 +83,26 @@ struct Pair {
     high_id: EndpointId,
 }
 
+/// Two endpoints that can reach each other, ordered by id: `(low_ep, low_id, high_ep, high_id)`.
+async fn connected_endpoints() -> (Endpoint, EndpointId, Endpoint, EndpointId) {
+    let (ep1, lk1) = bind().await;
+    let (ep2, lk2) = bind().await;
+    wait_for_addrs(&ep1).await;
+    wait_for_addrs(&ep2).await;
+    lk1.add_endpoint_info(ep2.addr());
+    lk2.add_endpoint_info(ep1.addr());
+
+    let (id1, id2) = (ep1.id(), ep2.id());
+    if id1 < id2 {
+        (ep1, id1, ep2, id2)
+    } else {
+        (ep2, id2, ep1, id1)
+    }
+}
+
 impl Pair {
     async fn setup() -> Self {
-        let (ep1, lk1) = bind().await;
-        let (ep2, lk2) = bind().await;
-        wait_for_addrs(&ep1).await;
-        wait_for_addrs(&ep2).await;
-        lk1.add_endpoint_info(ep2.addr());
-        lk2.add_endpoint_info(ep1.addr());
-
-        let (id1, id2) = (ep1.id(), ep2.id());
-        let ((low_ep, low_id), (high_ep, high_id)) =
-            if id1 < id2 { ((ep1, id1), (ep2, id2)) } else { ((ep2, id2), (ep1, id1)) };
+        let (low_ep, low_id, high_ep, high_id) = connected_endpoints().await;
 
         let low = PersistentConnection::builder(low_ep.clone(), high_id, ALPN.to_vec())
             .incoming(incoming_stream(&low_ep))
@@ -256,4 +265,127 @@ async fn reconnects_after_the_connection_is_dropped() {
     .expect("low side never reconnected after the drop");
 
     pair.shutdown().await;
+}
+
+/// Reports every connection it is given, then holds it until the connection closes or the link
+/// is cancelled. With `return_first`, the first connection is given back immediately.
+struct HoldHandler {
+    seen: mpsc::UnboundedSender<Connection>,
+    return_first: bool,
+    calls: usize,
+    cancelled: usize,
+}
+
+impl HoldHandler {
+    fn new(return_first: bool) -> (Self, mpsc::UnboundedReceiver<Connection>) {
+        let (seen, seen_rx) = mpsc::unbounded_channel();
+        (Self { seen, return_first, calls: 0, cancelled: 0 }, seen_rx)
+    }
+}
+
+impl ConnectionHandler for HoldHandler {
+    async fn handle(&mut self, conn: Connection, cancel: CancellationToken) -> Outcome {
+        self.calls += 1;
+        let _ = self.seen.send(conn.clone());
+        if self.return_first && self.calls == 1 {
+            return Outcome::Done;
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => self.cancelled += 1,
+            _ = conn.closed() => {}
+        }
+        Outcome::Done
+    }
+}
+
+/// The last connection a handler is given before things go quiet for a short grace period.
+async fn settled_handler_conn(seen: &mut mpsc::UnboundedReceiver<Connection>) -> Connection {
+    let mut latest = timeout(Duration::from_secs(20), seen.recv())
+        .await
+        .expect("handler was never given a connection")
+        .expect("handler dropped");
+    while let Ok(Some(next)) = timeout(Duration::from_millis(500), seen.recv()).await {
+        latest = next;
+    }
+    latest
+}
+
+#[tokio::test]
+#[test_log::test]
+async fn handlers_share_one_connection_and_are_returned_on_shutdown() {
+    let (low_ep, low_id, high_ep, high_id) = connected_endpoints().await;
+    let (low_cancel, high_cancel) = (CancellationToken::new(), CancellationToken::new());
+    let (low_handler, mut low_seen) = HoldHandler::new(false);
+    let (high_handler, mut high_seen) = HoldHandler::new(false);
+
+    let low = PersistentConnection::builder(low_ep.clone(), high_id, ALPN.to_vec())
+        .incoming(incoming_stream(&low_ep))
+        .cancellation(low_cancel.clone())
+        .spawn_with(low_handler);
+    let high = PersistentConnection::builder(high_ep.clone(), low_id, ALPN.to_vec())
+        .incoming(incoming_stream(&high_ep))
+        .cancellation(high_cancel.clone())
+        .spawn_with(high_handler);
+
+    let low_conn = settled_handler_conn(&mut low_seen).await;
+    let high_conn = settled_handler_conn(&mut high_seen).await;
+    assert_ne!(low_conn.side(), high_conn.side(), "peers landed on two different connections");
+    assert!(low_conn.close_reason().is_none() && high_conn.close_reason().is_none());
+
+    low_cancel.cancel();
+    high_cancel.cancel();
+    for link in [low, high] {
+        let end = timeout(Duration::from_secs(10), link.join()).await.expect("link never ended");
+        assert_eq!(end.result, Ok(()));
+        let handler = end.handler.expect("handler was lost");
+        assert!(handler.cancelled >= 1, "handler was not told to stop");
+    }
+    assert!(low_conn.close_reason().is_some(), "shutdown should close the connection");
+
+    low_ep.close().await;
+    high_ep.close().await;
+}
+
+#[tokio::test]
+#[test_log::test]
+async fn returning_from_the_handler_closes_the_connection_and_a_new_one_follows() {
+    let (low_ep, low_id, high_ep, high_id) = connected_endpoints().await;
+    let (low_cancel, high_cancel) = (CancellationToken::new(), CancellationToken::new());
+    let (low_handler, mut low_seen) = HoldHandler::new(true);
+    let (high_handler, mut high_seen) = HoldHandler::new(true);
+
+    let low = PersistentConnection::builder(low_ep.clone(), high_id, ALPN.to_vec())
+        .incoming(incoming_stream(&low_ep))
+        .cancellation(low_cancel.clone())
+        .spawn_with(low_handler);
+    let high = PersistentConnection::builder(high_ep.clone(), low_id, ALPN.to_vec())
+        .incoming(incoming_stream(&high_ep))
+        .cancellation(high_cancel.clone())
+        .spawn_with(high_handler);
+
+    // Both handlers return at once on their first connection; the library must close it and
+    // both sides must end up handling a different one.
+    for seen in [&mut low_seen, &mut high_seen] {
+        let first = timeout(Duration::from_secs(20), seen.recv()).await.unwrap().unwrap();
+        timeout(Duration::from_secs(30), async {
+            loop {
+                let next = seen.recv().await.expect("handler dropped");
+                if next.stable_id() != first.stable_id() {
+                    return next;
+                }
+            }
+        })
+        .await
+        .expect("no new connection was handled after the first one was returned");
+        assert!(first.close_reason().is_some(), "returned connection was not closed");
+    }
+
+    low_cancel.cancel();
+    high_cancel.cancel();
+    for link in [low, high] {
+        let end = timeout(Duration::from_secs(10), link.join()).await.expect("link never ended");
+        assert_eq!(end.result, Ok(()));
+    }
+    low_ep.close().await;
+    high_ep.close().await;
 }

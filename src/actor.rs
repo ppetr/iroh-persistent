@@ -129,7 +129,7 @@ impl<C: ManagedConnection> Actor<C> {
             // Do not notify the connector: we won't accept any more connections.
             false
         });
-        error::mask_cancelled(Err(result))
+        error::mask_cancelled(Err(error::settle(result, &cancellation)))
     }
 
     fn handle_connection_candidate(&self, closed_tx: &mpsc::Sender<C::ConnectionId>, new_conn: C) {
