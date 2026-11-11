@@ -186,10 +186,10 @@ async fn settles_on_a_single_shared_connection() {
 
 #[tokio::test]
 #[test_log::test]
-async fn actor_close_carries_the_configured_close_code() {
+async fn shutdown_close_carries_the_configured_close_code() {
     // A single managed link plus one plain, passive endpoint on the far side -- nothing there
     // runs a `PersistentConnection` of its own, so nothing redials or otherwise races the check
-    // below once the link's actor closes its connection.
+    // below once the link closes its connection.
     let (raw_ep, raw_lookup) = bind().await;
     let (link_ep, link_lookup) = bind().await;
     wait_for_addrs(&raw_ep).await;
@@ -208,12 +208,12 @@ async fn actor_close_carries_the_configured_close_code() {
 
     let _link_conn = wait_settled(&mut link).await;
 
-    // Dropping the link cancels its actor, which closes its held connection as part of shutdown
-    // -- an actor-initiated close, not one the test triggers directly.
+    // Dropping the link cancels it, which closes its held connection as part of shutdown
+    // -- a link-initiated close, not one the test triggers directly.
     drop(link);
 
     // `raw_conn` belongs to no `PersistentConnection`, so the only close it can observe is the
-    // one the link's actor just performed.
+    // one the link just performed.
     let close = timeout(Duration::from_secs(5), async {
         loop {
             if let Some(err) = raw_conn.close_reason() {

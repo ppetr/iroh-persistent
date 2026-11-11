@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! [`PersistentConnection`] and its [`Builder`].
+//! [`Builder`] and [`PersistentLink`]: a link to one peer whose connections are served by a
+//! [`ConnectionHandler`].
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -24,37 +25,33 @@ use futures_core::Stream;
 use futures_util::StreamExt;
 use iroh::endpoint::{Connection, VarInt};
 use iroh::{Endpoint, EndpointId};
-use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::Instrument;
 
-use crate::actor::{Actor, ActorHandle};
-use crate::connect::{HandlerFeedback, OutgoingConnectLoop};
-use crate::error::{self, await_loop_result, LoopError};
-use crate::handler::{ConnectionHandler, HandlerLoop};
+use crate::error::LoopError;
+use crate::handler::ConnectionHandler;
 use crate::iroh_conn::{IrohConnection, IrohConnector};
+use crate::link::{preferred_direction, Inbound, Link};
 
+type LinkTask<H> = JoinHandle<(H, Result<(), LoopError>)>;
 type ConnectionStream = Pin<Box<dyn Stream<Item = Connection> + Send>>;
 
-/// Default for [`Builder::stable_after`]: how long a connection must be held before the outgoing
-/// dial backoff is reset.
-pub const DEFAULT_STABLE_AFTER: Duration = Duration::from_secs(5);
-
-/// Builds a [`PersistentConnection`]. Created via [`PersistentConnection::builder`].
+/// Configures a link to one peer; finish with [`Builder::spawn_with`].
 pub struct Builder<B = ExponentialBackoff> {
     endpoint: Endpoint,
     remote: EndpointId,
     alpn: Vec<u8>,
     incoming: Option<ConnectionStream>,
     backoff: B,
-    stable_after: Duration,
+    pub(crate) stable_after: Duration,
     cancellation: Option<CancellationToken>,
     close_code: VarInt,
 }
 
 impl Builder<ExponentialBackoff> {
-    pub(crate) fn new(endpoint: Endpoint, remote: EndpointId, alpn: impl Into<Vec<u8>>) -> Self {
+    /// Starts configuring a link to `remote` over `endpoint`, using `alpn` for outgoing dials.
+    pub fn new(endpoint: Endpoint, remote: EndpointId, alpn: impl Into<Vec<u8>>) -> Self {
         Self {
             endpoint,
             remote,
@@ -62,7 +59,7 @@ impl Builder<ExponentialBackoff> {
             incoming: None,
             // Retry outgoing dials forever; the `backoff` default caps only total elapsed time.
             backoff: ExponentialBackoff { max_elapsed_time: None, ..Default::default() },
-            stable_after: DEFAULT_STABLE_AFTER,
+            stable_after: crate::legacy::DEFAULT_STABLE_AFTER,
             cancellation: None,
             close_code: VarInt::from_u32(0),
         }
@@ -96,28 +93,16 @@ impl<B: Backoff + Send + 'static> Builder<B> {
         }
     }
 
-    /// How long a connection must be held before the backoff between outgoing dials is reset
-    /// (default [`DEFAULT_STABLE_AFTER`]).
-    ///
-    /// A connection that is lost or replaced sooner -- typically one the peer immediately rejects
-    /// -- counts as a failed attempt, so the backoff keeps growing instead of restarting from its
-    /// initial delay. `Duration::ZERO` resets as soon as a connection is installed.
-    pub fn stable_after(mut self, stable_after: Duration) -> Self {
-        self.stable_after = stable_after;
-        self
-    }
-
-    /// Drive shutdown from an external token in addition to dropping the returned
-    /// [`PersistentConnection`].
+    /// Drive shutdown from an external token in addition to dropping the returned link.
     pub fn cancellation(mut self, token: CancellationToken) -> Self {
         self.cancellation = Some(token);
         self
     }
 
-    /// The QUIC application error code to close a connection with whenever `PersistentConnection`
-    /// does so on its own -- losing the deterministic-preference race, being replaced by the
-    /// preferred connection, an unexpected peer on the inbound stream, or shutdown. Defaults to
-    /// `0`.
+    /// The QUIC application error code to close a connection with whenever the link does so on
+    /// its own -- losing the deterministic-preference race, being replaced by the preferred
+    /// connection, an unexpected peer on the inbound stream, the handler finishing, or shutdown.
+    /// Defaults to `0`.
     ///
     /// This crate has no opinion on what the code should be; pick one from your own protocol's
     /// error-code space so a peer can tell these housekeeping closes apart from ones your
@@ -128,254 +113,96 @@ impl<B: Backoff + Send + 'static> Builder<B> {
         self
     }
 
-    /// Spawn the background tasks and return the handle; the current connection is published
-    /// through [`PersistentConnection::connection`].
+    /// Starts the link and hands every connection it settles on to `handler`, one at a time.
     ///
-    /// All of them are instrumented with [`tracing::Span::current()`] as seen at this call site
-    /// -- wrap the call in your own span (e.g. carrying a peer name) if you manage more than one
-    /// [`PersistentConnection`] and want to tell their log lines apart.
-    pub fn spawn(self) -> PersistentConnection {
-        let started = self.start(None);
-        PersistentConnection {
-            connection: started.conn_rx,
-            // `ActorHandle` carries a drop guard for `cancellation`; holding it here is what keeps
-            // the background tasks alive until this `PersistentConnection` is dropped.
-            _actor: started.actor,
-            _supervisor: started.supervisor,
-        }
-    }
-
-    /// Like [`Self::spawn`], but instead of publishing the connection the library hands every
-    /// connection it installs to `handler`, one at a time.
-    ///
-    /// The handler's [`crate::Outcome`] replaces [`Self::stable_after`] as the rule for resetting the
-    /// dial backoff: [`crate::Outcome::Done`] resets it, [`crate::Outcome::Failed`] keeps it growing. When
-    /// [`ConnectionHandler::handle`] returns, the library closes the connection. Dropping the
+    /// The handler's [`crate::Outcome`] is the rule for resetting the dial backoff:
+    /// [`crate::Outcome::Done`] resets it, [`crate::Outcome::Failed`] keeps it growing. When
+    /// [`ConnectionHandler::handle`] returns, the link closes the connection. Dropping the
     /// returned [`PersistentLink`] shuts everything down; see also [`PersistentLink::join`].
+    ///
+    /// The link task is instrumented with [`tracing::Span::current()`] as seen at this call site
+    /// -- wrap the call in your own span (e.g. carrying a peer name) if you manage more than one
+    /// link and want to tell their log lines apart.
     pub fn spawn_with<H: ConnectionHandler>(self, handler: H) -> PersistentLink<H> {
-        let close_code = self.close_code;
-        let (busy_tx, busy_rx) = watch::channel(false);
-        let (outcome_tx, outcome_rx) = mpsc::unbounded_channel();
-        let started = self.start(Some(HandlerFeedback { busy: busy_rx, outcomes: outcome_rx }));
-
-        let handler_loop = HandlerLoop {
-            handler,
-            conn_rx: started.conn_rx,
-            outcomes: outcome_tx,
-            busy: busy_tx,
-            close_code,
-        };
-        PersistentLink {
-            handler_task: handler_loop.spawn(started.cancellation),
-            _actor: started.actor,
-            supervisor: started.supervisor,
-        }
+        let (task, guard) = self.launch(handler);
+        PersistentLink { task, _guard: guard }
     }
 
-    /// Spawns the actor, the dial loop, the inbound pump and the slot mirror.
-    fn start(self, feedback: Option<HandlerFeedback>) -> Started {
+    /// Spawns the link task. The guard cancels it when dropped.
+    pub(crate) fn launch<H: ConnectionHandler>(self, handler: H) -> (LinkTask<H>, DropGuard) {
         let cancellation = self.cancellation.unwrap_or_default();
-        let local_id = self.endpoint.id();
         let remote = self.remote;
+        let close_code = self.close_code;
 
         let connector = IrohConnector {
-            endpoint: self.endpoint,
+            endpoint: self.endpoint.clone(),
             remote,
             alpn: Arc::from(self.alpn.into_boxed_slice()),
-            close_code: self.close_code,
+            close_code,
         };
-
-        // The actor owns the authoritative `Option<IrohConnection>` slot.
-        let (state_tx, state_rx) = watch::channel(None);
-        let actor = Actor::new(local_id, remote, state_tx);
-        let (actor_handle, actor_join) = actor.spawn(cancellation.clone());
-
-        let mut outgoing = OutgoingConnectLoop::new(
+        let link = Link {
             connector,
-            state_rx.clone(),
-            actor_handle.conn_tx.clone(),
-            self.stable_after,
+            handler,
+            inbound: Inbound::new(self.incoming.map(|s| expect_remote(s, remote, close_code))),
+            preferred: preferred_direction(&self.endpoint.id(), &remote),
+        };
+        let task = tokio::spawn(
+            link.run(self.backoff, cancellation.clone()).instrument(tracing::Span::current()),
         );
-        if let Some(feedback) = feedback {
-            outgoing = outgoing.with_feedback(feedback);
-        }
-        let outgoing_join = outgoing.spawn(self.backoff, cancellation.clone());
-
-        let incoming_join = spawn_incoming_pump(
-            self.incoming,
-            remote,
-            self.close_code,
-            actor_handle.conn_tx.clone(),
-            cancellation.clone(),
-        );
-
-        // Mirror the actor's slot into a channel of the raw `Connection`, so the internal
-        // `IrohConnection` wrapper never reaches the caller.
-        let (conn_tx, conn_rx) = watch::channel(None);
-        spawn_state_mirror(state_rx, conn_tx, cancellation.clone());
-
-        let supervisor = tokio::spawn(async move {
-            await_loop_result(outgoing_join).await?;
-            await_loop_result(incoming_join).await?;
-            await_loop_result(actor_join).await
-        });
-
-        Started { cancellation, conn_rx, actor: actor_handle, supervisor }
+        (task, cancellation.drop_guard())
     }
 }
 
-/// The tasks spawned by [`Builder::start`].
-struct Started {
-    cancellation: CancellationToken,
-    conn_rx: watch::Receiver<Option<Connection>>,
-    actor: ActorHandle<IrohConnection>,
-    supervisor: JoinHandle<Result<(), LoopError>>,
+/// Closes connections of `incoming` that are not from `remote` and wraps the rest.
+fn expect_remote(
+    incoming: ConnectionStream,
+    remote: EndpointId,
+    close_code: VarInt,
+) -> Pin<Box<dyn Stream<Item = IrohConnection> + Send>> {
+    incoming
+        .filter_map(move |conn| async move {
+            let actual = conn.remote_id();
+            if actual != remote {
+                tracing::warn!(expected = %remote, %actual,
+                    "incoming connection from an unexpected peer; closing it");
+                conn.close(close_code, b"unexpected peer");
+                None
+            } else {
+                Some(IrohConnection::new(conn, close_code))
+            }
+        })
+        .boxed()
 }
 
 /// A link whose connections are served by a [`ConnectionHandler`]; see [`Builder::spawn_with`].
 ///
 /// Drop it to close the connection and stop all background work.
 pub struct PersistentLink<H> {
-    handler_task: JoinHandle<(H, Result<(), LoopError>)>,
-    // Keeps the background tasks alive; see `PersistentConnection::_actor`.
-    _actor: ActorHandle<IrohConnection>,
-    supervisor: JoinHandle<Result<(), LoopError>>,
+    task: LinkTask<H>,
+    _guard: DropGuard,
 }
 
 /// How a [`PersistentLink`] ended.
 #[derive(Debug)]
 pub struct LinkEnd<H> {
     /// The handler, handed back so the application can finish its own cleanup. `None` if the
-    /// handler's task panicked (and `result` is then [`LoopError::Panicked`]).
+    /// link's task panicked (and `result` is then [`LoopError::Panicked`]).
     pub handler: Option<H>,
-    /// `Ok` after a normal shutdown, otherwise the first error of the link's tasks.
+    /// `Ok` after a normal shutdown, otherwise why the link ended.
     pub result: Result<(), LoopError>,
 }
 
 impl<H> PersistentLink<H> {
-    /// Waits until the link ends -- cancellation through [`Builder::cancellation`], or a failure of
-    /// one of its tasks -- and returns the handler. The handler is no longer running by then.
+    /// Waits until the link ends -- cancellation through [`Builder::cancellation`], or a failure
+    /// of the link task -- and returns the handler. The handler is no longer running by then.
     pub async fn join(self) -> LinkEnd<H> {
-        let (handler, handler_result) = match self.handler_task.await {
-            Ok((handler, result)) => (Some(handler), result),
-            Err(err) if err.is_cancelled() => (None, Ok(())),
+        match self.task.await {
+            Ok((handler, result)) => LinkEnd { handler: Some(handler), result },
+            Err(err) if err.is_cancelled() => LinkEnd { handler: None, result: Ok(()) },
             Err(err) => {
-                tracing::error!(error = ?err, "connection handler task panicked");
-                (None, Err(LoopError::Panicked))
-            }
-        };
-        let result = handler_result.and(await_loop_result(self.supervisor).await);
-        LinkEnd { handler, result }
-    }
-}
-
-/// A single, self-healing Iroh connection to one peer.
-///
-/// Drop it to close the connection and stop all background work.
-pub struct PersistentConnection {
-    connection: watch::Receiver<Option<Connection>>,
-    _actor: ActorHandle<IrohConnection>,
-    _supervisor: JoinHandle<Result<(), LoopError>>,
-}
-
-impl PersistentConnection {
-    /// Start configuring a persistent link to `remote` over `endpoint`, using `alpn` for outgoing
-    /// dials.
-    pub fn builder(endpoint: Endpoint, remote: EndpointId, alpn: impl Into<Vec<u8>>) -> Builder {
-        Builder::new(endpoint, remote, alpn)
-    }
-
-    /// A [`watch`] receiver of the current connection: `Some` while one is held, `None` otherwise.
-    pub fn connection(&self) -> watch::Receiver<Option<Connection>> {
-        self.connection.clone()
-    }
-
-    /// The current connection, if any, without waiting.
-    pub fn current(&self) -> Option<Connection> {
-        self.connection.borrow().clone()
-    }
-
-    /// Wait for the next change and return the new state. `Err` only once the link has shut down.
-    pub async fn changed(&mut self) -> Result<Option<Connection>, watch::error::RecvError> {
-        self.connection.changed().await?;
-        Ok(self.connection.borrow_and_update().clone())
-    }
-}
-
-/// Reads connections from `incoming`, drops any that are not from `remote`, and forwards the rest
-/// to the actor. A closed or absent stream is not an error -- the task simply parks until
-/// cancellation, leaving the outgoing dialer running.
-fn spawn_incoming_pump(
-    incoming: Option<ConnectionStream>,
-    remote: EndpointId,
-    close_code: VarInt,
-    conn_tx: mpsc::Sender<IrohConnection>,
-    cancellation: CancellationToken,
-) -> JoinHandle<Result<(), LoopError>> {
-    let span = tracing::Span::current();
-    tokio::spawn(async move {
-        let _cancel = cancellation.drop_guard_ref();
-        let Some(mut incoming) = incoming else {
-            cancellation.cancelled().await;
-            return Err(LoopError::Cancelled);
-        };
-        loop {
-            tokio::select! {
-                _ = cancellation.cancelled() => return Err(LoopError::Cancelled),
-                next = incoming.next() => {
-                    let Some(conn) = next else {
-                        tracing::debug!("incoming connection stream ended; outgoing dials continue");
-                        cancellation.cancelled().await;
-                        return Err(LoopError::Cancelled);
-                    };
-                    let actual = conn.remote_id();
-                    if actual != remote {
-                        tracing::warn!(expected = %remote, %actual,
-                            "incoming connection from an unexpected peer; closing it");
-                        conn.close(close_code, b"unexpected peer");
-                        continue;
-                    }
-                    if conn_tx.send(IrohConnection { conn, close_code }).await.is_err() {
-                        return Err(error::settle(LoopError::ChannelClosed, &cancellation));
-                    }
-                }
+                tracing::error!(error = ?err, "link task panicked");
+                LinkEnd { handler: None, result: Err(LoopError::Panicked) }
             }
         }
-    }.instrument(span))
-}
-
-/// Mirrors the actor's `Option<IrohConnection>` slot 1:1 into `conn_tx` as `Option<Connection>`.
-fn spawn_state_mirror(
-    mut state_rx: watch::Receiver<Option<IrohConnection>>,
-    conn_tx: watch::Sender<Option<Connection>>,
-    cancellation: CancellationToken,
-) {
-    let span = tracing::Span::current();
-    tokio::spawn(
-        async move {
-            let _cancel = cancellation.drop_guard_ref();
-            publish(&conn_tx, &state_rx.borrow_and_update());
-            loop {
-                tokio::select! {
-                    _ = cancellation.cancelled() => return,
-                    changed = state_rx.changed() => {
-                        if changed.is_err() {
-                            return;
-                        }
-                        publish(&conn_tx, &state_rx.borrow_and_update());
-                    }
-                }
-            }
-        }
-        .instrument(span),
-    );
-}
-
-fn publish(conn_tx: &watch::Sender<Option<Connection>>, state: &Option<IrohConnection>) {
-    let next = state.as_ref().map(|c| c.conn.clone());
-    let changed = conn_tx.borrow().as_ref().map(Connection::stable_id)
-        != next.as_ref().map(Connection::stable_id);
-    if changed {
-        conn_tx.send_replace(next);
     }
 }

@@ -14,24 +14,25 @@
 
 //! Iroh implementations of [`ManagedConnection`] and [`OutgoingConnector`].
 
+use std::future::Future;
 use std::sync::Arc;
 
 use futures_util::StreamExt;
 use iroh::endpoint::{ConnectError, Connection, Endpoint, PathInfoList, Side, VarInt};
 use iroh::{EndpointAddr, EndpointId, Watcher};
-use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
-use crate::actor::{Direction, ManagedConnection};
-use crate::connect::OutgoingConnector;
+use crate::handler::{ConnectionHandler, Outcome};
+use crate::link::{Direction, ManagedConnection, OutgoingConnector, Serve};
 
-/// An Iroh [`Connection`], carried through the actor as the managed handle.
+/// An Iroh [`Connection`] as the link loop handles it.
 #[derive(Clone)]
-pub struct IrohConnection {
-    pub conn: Connection,
+pub(crate) struct IrohConnection {
+    conn: Connection,
     /// QUIC application error code used when this crate closes `conn` on its own; see
     /// [`crate::Builder::close_code`].
-    pub(crate) close_code: VarInt,
+    close_code: VarInt,
 }
 
 impl std::fmt::Debug for IrohConnection {
@@ -40,6 +41,14 @@ impl std::fmt::Debug for IrohConnection {
             .field("id", &self.conn.stable_id())
             .field("side", &self.conn.side())
             .finish()
+    }
+}
+
+impl IrohConnection {
+    /// Wraps `conn` and starts logging its paths.
+    pub fn new(conn: Connection, close_code: VarInt) -> Self {
+        spawn_path_logger(conn.clone());
+        Self { conn, close_code }
     }
 }
 
@@ -68,16 +77,7 @@ fn spawn_path_logger(conn: Connection) {
     );
 }
 
-impl PartialEq<IrohConnection> for Connection {
-    fn eq(&self, other: &IrohConnection) -> bool {
-        self.stable_id() == other.conn.stable_id()
-    }
-}
-
 impl ManagedConnection for IrohConnection {
-    type Key = EndpointId;
-    type ConnectionId = Connection;
-
     fn direction(&self) -> Direction {
         match self.conn.side() {
             Side::Client => Direction::Outgoing,
@@ -85,28 +85,32 @@ impl ManagedConnection for IrohConnection {
         }
     }
 
-    fn close(self, reason: &str) {
+    fn close(&self, reason: &str) {
         tracing::debug!(id = self.conn.stable_id(), reason, "closing connection");
         self.conn.close(self.close_code, reason.as_bytes());
     }
 
-    fn spawn_closed_watcher(&self, on_close: mpsc::Sender<Self::ConnectionId>) {
+    fn closed(&self) -> impl Future<Output = ()> + Send {
         let conn = self.conn.clone();
-        spawn_path_logger(conn.clone());
-        tokio::spawn(
-            async move {
-                let reason = conn.closed().await;
-                tracing::debug!(id = conn.stable_id(), %reason, "connection closed");
-                let _ = on_close.send(conn).await;
-            }
-            .instrument(tracing::Span::current()),
-        );
+        async move {
+            let reason = conn.closed().await;
+            tracing::debug!(id = conn.stable_id(), %reason, "connection closed");
+        }
+    }
+}
+
+impl<H: ConnectionHandler> Serve<IrohConnection> for H {
+    fn serve(
+        &mut self,
+        conn: IrohConnection,
+        cancel: CancellationToken,
+    ) -> impl Future<Output = Outcome> + Send {
+        self.handle(conn.conn, cancel)
     }
 }
 
 /// Dials a fixed remote [`EndpointId`] over a shared [`Endpoint`].
-#[derive(Clone, Debug)]
-pub struct IrohConnector {
+pub(crate) struct IrohConnector {
     pub endpoint: Endpoint,
     pub remote: EndpointId,
     pub alpn: Arc<[u8]>,
@@ -120,6 +124,6 @@ impl OutgoingConnector for IrohConnector {
     async fn connect(&self) -> Result<IrohConnection, Self::Error> {
         let conn =
             self.endpoint.connect(EndpointAddr::from(self.remote), self.alpn.as_ref()).await?;
-        Ok(IrohConnection { conn, close_code: self.close_code })
+        Ok(IrohConnection::new(conn, self.close_code))
     }
 }
