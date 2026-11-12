@@ -27,6 +27,7 @@ use strum_macros::{AsRefStr, EnumString};
 /// recovers the variant from that prefix, for example out of a QUIC close reason this crate
 /// closed a connection with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, AsRefStr, EnumString)]
+#[non_exhaustive]
 pub enum LoopError {
     /// The loop's cancellation token fired (normal shutdown).
     Cancelled,

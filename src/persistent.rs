@@ -187,6 +187,7 @@ pub struct PersistentLink<H> {
 
 /// How a [`PersistentLink`] ended.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct LinkEnd<H> {
     /// The handler, handed back so the application can finish its own cleanup. `None` if the
     /// link's task panicked (and `result` is then [`LoopError::Panicked`]).
