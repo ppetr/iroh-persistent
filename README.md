@@ -56,7 +56,7 @@ Dropping the `PersistentLink` closes the connection and stops the link.
 
 The older, simpler `PersistentConnection` publishes the current connection through a
 `tokio::sync::watch` channel of `Option<Connection>` instead. It is built on the handler API and
-planned for removal in 0.2.0.
+deprecated since 0.2.0 and planned for removal in 0.3.0.
 
 ## Design
 

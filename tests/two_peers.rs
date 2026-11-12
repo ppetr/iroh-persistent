@@ -20,6 +20,8 @@
 //! Hermetic: `presets::Minimal` (no relay, no n0 discovery) plus a `MemoryLookup` seeded with each
 //! endpoint's own direct addresses, so nothing leaves the machine.
 
+#![allow(deprecated)]
+
 use std::time::Duration;
 
 use iroh::address_lookup::memory::MemoryLookup;

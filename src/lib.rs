@@ -59,7 +59,7 @@
 //! [`PersistentConnection`] is a simpler layer on top, publishing the current connection through
 //! a [`tokio::sync::watch`] channel of `Option<Connection>` (`None` while there is none). The
 //! backoff is reset once a connection has been held for [`DEFAULT_STABLE_AFTER`] or the
-//! configured [`Builder::stable_after`]. It is planned for removal in 0.2.0.
+//! configured [`Builder::stable_after`]. It is deprecated and planned for removal in 0.3.0.
 //!
 //! ```no_run
 //! # async fn run(endpoint: iroh::Endpoint, remote: iroh::EndpointId) {
@@ -88,6 +88,7 @@ mod persistent;
 
 pub use error::LoopError;
 pub use handler::{ConnectionHandler, Outcome};
+#[allow(deprecated)]
 pub use legacy::{PersistentConnection, DEFAULT_STABLE_AFTER};
 pub use persistent::{Builder, LinkEnd, PersistentLink};
 

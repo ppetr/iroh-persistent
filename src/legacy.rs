@@ -12,8 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The original watch-channel API, built on the handler API. Planned for removal in 0.2.0; nothing
+//! The original watch-channel API, built on the handler API. Deprecated, planned for removal in 0.3.0; nothing
 //! else in the crate depends on this module.
+
+#![allow(deprecated)]
 
 use std::time::Duration;
 
@@ -29,6 +31,7 @@ use crate::persistent::Builder;
 
 /// Default for [`Builder::stable_after`]: how long a connection must be held before the outgoing
 /// dial backoff is reset.
+#[deprecated(since = "0.2.0", note = "belongs to the legacy watch API; see `Builder::spawn_with`")]
 pub const DEFAULT_STABLE_AFTER: Duration = Duration::from_secs(5);
 
 impl<B: Backoff + Send + 'static> Builder<B> {
@@ -38,6 +41,10 @@ impl<B: Backoff + Send + 'static> Builder<B> {
     /// A connection that is lost or replaced sooner -- typically one the peer immediately rejects
     /// -- counts as a failed attempt, so the backoff keeps growing instead of restarting from its
     /// initial delay. `Duration::ZERO` resets as soon as a connection is installed.
+    #[deprecated(
+        since = "0.2.0",
+        note = "belongs to the legacy watch API; see `Builder::spawn_with`"
+    )]
     pub fn stable_after(mut self, stable_after: Duration) -> Self {
         self.stable_after = stable_after;
         self
@@ -49,6 +56,7 @@ impl<B: Backoff + Send + 'static> Builder<B> {
     /// The link task is instrumented with [`tracing::Span::current()`] as seen at this call site
     /// -- wrap the call in your own span (e.g. carrying a peer name) if you manage more than one
     /// link and want to tell their log lines apart.
+    #[deprecated(since = "0.2.0", note = "use `Builder::spawn_with`")]
     pub fn spawn(self) -> PersistentConnection {
         let (tx, rx) = watch::channel(None);
         let handler = PublishHandler { tx, stable_after: self.stable_after };
@@ -87,6 +95,7 @@ impl ConnectionHandler for PublishHandler {
 /// A single, self-healing Iroh connection to one peer.
 ///
 /// Drop it to close the connection and stop all background work.
+#[deprecated(since = "0.2.0", note = "use `Builder::spawn_with`")]
 pub struct PersistentConnection {
     connection: watch::Receiver<Option<Connection>>,
     _guard: DropGuard,

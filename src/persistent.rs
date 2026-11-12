@@ -59,6 +59,7 @@ impl Builder<ExponentialBackoff> {
             incoming: None,
             // Retry outgoing dials forever; the `backoff` default caps only total elapsed time.
             backoff: ExponentialBackoff { max_elapsed_time: None, ..Default::default() },
+            #[allow(deprecated)]
             stable_after: crate::legacy::DEFAULT_STABLE_AFTER,
             cancellation: None,
             close_code: VarInt::from_u32(0),

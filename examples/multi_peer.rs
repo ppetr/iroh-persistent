@@ -18,6 +18,8 @@
 //!
 //! Run with: `cargo run --example multi_peer` (it just sets the wiring up and exits).
 
+#![allow(deprecated)]
+
 use std::collections::HashMap;
 
 use iroh::endpoint::{presets, Connection};
