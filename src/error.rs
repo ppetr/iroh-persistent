@@ -34,6 +34,8 @@ pub enum LoopError {
     BackoffExhausted,
     /// A spawned loop task panicked.
     Panicked,
+    /// The stream of inbound connections ended while the link was still running.
+    IncomingEnded,
 }
 
 impl LoopError {
@@ -42,6 +44,7 @@ impl LoopError {
             LoopError::Cancelled => "loop cancelled",
             LoopError::BackoffExhausted => "backoff exhausted",
             LoopError::Panicked => "loop task panicked",
+            LoopError::IncomingEnded => "inbound connection stream ended",
         }
     }
 }

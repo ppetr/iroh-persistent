@@ -95,17 +95,13 @@ impl<C> Inbound<C> {
         Self(stream)
     }
 
-    /// The next inbound connection. Waits forever if there is no stream or it has ended, so that
-    /// the dialing goes on without it.
-    async fn next(&mut self) -> C {
-        if let Some(stream) = &mut self.0 {
-            if let Some(conn) = stream.next().await {
-                return conn;
-            }
-            tracing::debug!("incoming connection stream ended; outgoing dials continue");
-            self.0 = None;
+    /// The next inbound connection. Waits forever if there is no stream; fails with
+    /// [`LoopError::IncomingEnded`] if the stream ends, which the link treats as a fatal error.
+    async fn next(&mut self) -> Result<C, LoopError> {
+        match &mut self.0 {
+            Some(stream) => stream.next().await.ok_or(LoopError::IncomingEnded),
+            None => std::future::pending().await,
         }
-        std::future::pending().await
     }
 }
 
@@ -117,7 +113,8 @@ enum Served<C> {
     Replaced(C),
     /// The peer closed the connection and the handler then ignored its cancellation.
     Abandoned,
-    Shutdown,
+    /// The link has to end for the given reason.
+    Ended(LoopError),
 }
 
 /// Why the loop stopped waiting for the handler.
@@ -125,6 +122,7 @@ enum Stop<C> {
     ByPeer,
     Replaced(C),
     Shutdown,
+    IncomingEnded,
 }
 
 pub(crate) struct Link<T: OutgoingConnector, H> {
@@ -164,8 +162,14 @@ impl<T: OutgoingConnector, H: Serve<T::Connection>> Link<T, H> {
                 }
                 Served::Outcome(Outcome::Failed) | Served::Abandoned => {}
                 Served::Replaced(next) => pending = Some(next),
-                Served::Shutdown => break LoopError::Cancelled,
+                Served::Ended(err) => break err,
             }
+        };
+        // The inbound stream usually ends because the application is shutting down.
+        let err = if err == LoopError::IncomingEnded && cancel.is_cancelled() {
+            LoopError::Cancelled
+        } else {
+            err
         };
         tracing::info!(error = ?err, "exiting the link loop");
         (self.handler, error::mask_cancelled(Err(err)))
@@ -187,8 +191,9 @@ impl<T: OutgoingConnector, H: Serve<T::Connection>> Link<T, H> {
                 connector.connect().await
             };
             tokio::select! {
+                biased;
                 _ = cancel.cancelled() => return Err(LoopError::Cancelled),
-                conn = self.inbound.next() => return Ok(conn),
+                conn = self.inbound.next() => return conn,
                 result = dial => match result {
                     Ok(conn) => return Ok(conn),
                     Err(err) => tracing::info!(
@@ -223,6 +228,7 @@ impl<T: OutgoingConnector, H: Serve<T::Connection>> Link<T, H> {
                 }
                 _ = &mut closed => break Stop::ByPeer,
                 candidate = self.inbound.next() => {
+                    let Ok(candidate) = candidate else { break Stop::IncomingEnded };
                     if candidate.direction() == self.preferred {
                         tracing::debug!(?candidate, ?conn, "replacing the current connection");
                         break Stop::Replaced(candidate);
@@ -243,10 +249,14 @@ impl<T: OutgoingConnector, H: Serve<T::Connection>> Link<T, H> {
         };
         match stop {
             Stop::Shutdown => {
-                // The full "Name: message" text, not the shorter `AsRef<str>` clippy suggests.
-                #[allow(clippy::unnecessary_to_owned)]
-                conn.close(&LoopError::Cancelled.to_string());
-                Served::Shutdown
+                let reason = LoopError::Cancelled.to_string();
+                conn.close(&reason);
+                Served::Ended(LoopError::Cancelled)
+            }
+            Stop::IncomingEnded => {
+                let reason = LoopError::IncomingEnded.to_string();
+                conn.close(&reason);
+                Served::Ended(LoopError::IncomingEnded)
             }
             Stop::Replaced(next) => {
                 conn.close("replaced by a preferred-direction connection");
@@ -767,25 +777,45 @@ mod tests {
     #[tokio::test]
     #[test_log::test]
     #[ntest::timeout(300)]
-    async fn an_ended_inbound_stream_does_not_stop_the_dialing() {
-        // A hot loop on the ended stream would never let the paused clock advance.
+    async fn an_ended_inbound_stream_ends_the_link_while_dialing() {
         tokio::time::pause();
+        let (h, run) = link(Outgoing, &[1.0], vec![], vec![]);
+        drop(h.inbound);
+        assert_eq!(run.await.1, Err(LoopError::IncomingEnded));
+    }
+
+    #[tokio::test]
+    #[test_log::test]
+    #[ntest::timeout(300)]
+    async fn an_ended_inbound_stream_ends_the_link_and_closes_the_connection_being_served() {
+        tokio::time::pause();
+        let conn = Fake::new(1, Outgoing);
         let (h, run) = link(
             Outgoing,
-            &[1.0],
-            vec![Ok(Fake::new(1, Outgoing))],
+            &[0.0],
+            vec![Ok(conn.clone())],
             vec![Behavior::WaitCancel(secs(0.0), Outcome::Done)],
         );
-
-        let Harness { inbound, cancel, served, .. } = h;
-        drop(inbound);
+        let Harness { inbound, resets, .. } = h;
         let scenario = async {
-            tokio::time::sleep(secs(5.0)).await;
-            assert_eq!(*served.lock().unwrap(), vec![1]);
-            cancel.cancel();
+            tokio::time::sleep(secs(1.0)).await;
+            drop(inbound);
         };
 
         let (result, _) = tokio::join!(run, scenario);
-        assert_eq!(result.1, Ok(()));
+        assert_eq!(result.1, Err(LoopError::IncomingEnded));
+        assert!(conn.reason().unwrap().starts_with("IncomingEnded"));
+        assert_eq!(resets.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    #[test_log::test]
+    #[ntest::timeout(300)]
+    async fn an_inbound_stream_ending_during_shutdown_is_a_normal_end() {
+        tokio::time::pause();
+        let (h, run) = link(Outgoing, &[1.0], vec![], vec![]);
+        h.cancel.cancel();
+        drop(h.inbound);
+        assert_eq!(run.await.1, Ok(()));
     }
 }

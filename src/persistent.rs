@@ -71,6 +71,9 @@ impl<B: Backoff + Send + 'static> Builder<B> {
     ///
     /// The stream must already be filtered to the configured remote; a connection from any other
     /// peer is logged and closed.
+    ///
+    /// The stream is expected to stay open for the lifetime of the link. If it ends, the link
+    /// ends with [`LoopError::IncomingEnded`] (unless it is already shutting down).
     pub fn incoming<S>(mut self, stream: S) -> Self
     where
         S: Stream<Item = Connection> + Send + 'static,
